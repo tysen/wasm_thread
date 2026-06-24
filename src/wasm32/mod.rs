@@ -57,8 +57,7 @@ impl WorkerMessage {
     pub fn post(self) {
         let req = Box::new(self);
 
-        js_sys::eval("self")
-            .unwrap()
+        js_sys::global()
             .dyn_into::<DedicatedWorkerGlobalScope>()
             .unwrap()
             .post_message(&JsValue::from(Box::into_raw(req) as u32))
@@ -297,7 +296,10 @@ impl Builder {
 
         #[cfg(feature = "es_modules")]
         {
-            js_sys::eval(include_str!("js/module_workers_polyfill.min.js")).unwrap();
+            // frustum fork: skip wasm_thread's module-workers polyfill. It's eval'd
+            // (and internally uses `new Function`), so it's CSP-blocked, and it's
+            // only needed for browsers lacking native module-worker support — which
+            // our targets (SharedArrayBuffer + atomics) all have.
             options.set_type(WorkerType::Module);
         }
         #[cfg(not(feature = "es_modules"))]

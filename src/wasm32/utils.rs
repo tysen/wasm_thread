@@ -7,12 +7,29 @@ use std::{
 use wasm_bindgen::prelude::*;
 use web_sys::{Blob, Url, WorkerGlobalScope};
 
+// frustum fork: drop wasm_thread's `js_sys::eval` usage so it works under a strict
+// CSP `script-src` lacking `'unsafe-eval'`. Worker-context detection reads the
+// global via `js_sys::global()`, and the bindgen shim URL comes from
+// `import.meta.url` (cribbed from firewheel-web-audio) instead of an eval'd
+// stacktrace probe. Both require the ES-module bindgen target (`--target web`).
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen]
+    type ImportMeta;
+
+    #[wasm_bindgen(method, getter)]
+    fn url(this: &ImportMeta) -> String;
+
+    #[wasm_bindgen(js_namespace = import, js_name = meta, thread_local)]
+    static IMPORT_META: ImportMeta;
+}
+
 pub fn available_parallelism() -> io::Result<NonZeroUsize> {
     if let Some(window) = web_sys::window() {
         return Ok(NonZeroUsize::new(window.navigator().hardware_concurrency() as usize).unwrap());
     }
 
-    if let Ok(worker) = js_sys::eval("self").unwrap().dyn_into::<WorkerGlobalScope>() {
+    if let Ok(worker) = js_sys::global().dyn_into::<WorkerGlobalScope>() {
         return Ok(NonZeroUsize::new(worker.navigator().hardware_concurrency() as usize).unwrap());
     }
 
@@ -23,18 +40,14 @@ pub fn available_parallelism() -> io::Result<NonZeroUsize> {
 }
 
 pub fn is_web_worker_thread() -> bool {
-    js_sys::eval("self").unwrap().dyn_into::<WorkerGlobalScope>().is_ok()
+    js_sys::global().dyn_into::<WorkerGlobalScope>().is_ok()
 }
 
-/// Extracts path of the `wasm_bindgen` generated .js shim script.
-///
-/// Internally, this intentionally generates a javascript exception to obtain a stacktrace containing the current script
-/// URL.
+/// Path of the `wasm_bindgen`-generated .js shim, read from `import.meta.url`
+/// (requires an ES-module bindgen target, i.e. `--target web`).
+#[allow(deprecated)]
 pub fn get_wasm_bindgen_shim_script_path() -> String {
-    js_sys::eval(include_str!("js/script_path.js"))
-        .unwrap()
-        .as_string()
-        .unwrap()
+    IMPORT_META.with(|m| m.url())
 }
 
 /// Generates worker entry script as URL encoded blob
