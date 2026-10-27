@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     cell::UnsafeCell,
     fmt,
     marker::PhantomData,
@@ -22,15 +23,22 @@ mod signal;
 mod utils;
 
 struct WebWorkerContext {
-    func: Box<dyn FnOnce() + Send>,
+    /// The thread's work; a promise where the work is a future the worker lives until.
+    func: Box<dyn FnOnce() -> Option<js_sys::Promise> + Send>,
 }
 
-/// Entry point for web workers
+/// Entry point for web workers: the worker script closes the worker once the
+/// returned value settles, so a future's worker outlives this call.
 #[wasm_bindgen]
-pub fn wasm_thread_entry_point(ptr: u32) {
+pub fn wasm_thread_entry_point(ptr: u32) -> JsValue {
     let ctx = unsafe { Box::from_raw(ptr as *mut WebWorkerContext) };
-    (ctx.func)();
-    WorkerMessage::ThreadComplete.post();
+    match (ctx.func)() {
+        Some(promise) => promise.into(),
+        None => {
+            WorkerMessage::ThreadComplete.post();
+            JsValue::UNDEFINED
+        }
+    }
 }
 
 /// Used to relay spawn requests from web workers to main thread
@@ -225,7 +233,7 @@ impl Builder {
         }
 
         let f = MaybeDangling::new(f);
-        let main = Box::new(move || {
+        let main: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
             // SAFETY: we constructed `f` initialized.
             let f = f.into_inner();
             // Execute the closure and catch any panics
@@ -245,9 +253,16 @@ impl Builder {
             // after that before returning itself.
         });
 
+        let main: Box<dyn FnOnce() -> Option<js_sys::Promise> + Send + 'a> = Box::new(move || {
+            main();
+            None
+        });
         // Erase lifetime
         let context = WebWorkerContext {
-            func: mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Box<dyn FnOnce() + Send + 'static>>(main),
+            func: mem::transmute::<
+                Box<dyn FnOnce() -> Option<js_sys::Promise> + Send + 'a>,
+                Box<dyn FnOnce() -> Option<js_sys::Promise> + Send + 'static>,
+            >(main),
         };
 
         if is_web_worker_thread() {
@@ -264,6 +279,30 @@ impl Builder {
             signal: my_signal,
             packet: my_packet,
         })
+    }
+
+    /// Spawns a thread that runs the future `f` returns to completion; the worker
+    /// lives until it settles. No handle: the future is the thread's whole life.
+    pub fn spawn_async<F, Fut>(self, f: F) -> std::io::Result<()>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let context = WebWorkerContext {
+            func: Box::new(move || {
+                Some(wasm_bindgen_futures::future_to_promise(async move {
+                    f().await;
+                    WorkerMessage::ThreadComplete.post();
+                    Ok(JsValue::UNDEFINED)
+                }))
+            }),
+        };
+        if is_web_worker_thread() {
+            WorkerMessage::SpawnThread(BuilderRequest { builder: self, context }).post();
+        } else {
+            unsafe { self.spawn_for_context(context) };
+        }
+        Ok(())
     }
 
     unsafe fn spawn_for_context(self, ctx: WebWorkerContext) {
@@ -451,6 +490,15 @@ impl<T> fmt::Debug for JoinHandle<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("JoinHandle { .. }")
     }
+}
+
+/// Spawns a thread that runs the future `f` returns to completion, see [`Builder::spawn_async`].
+pub fn spawn_async<F, Fut>(f: F) -> std::io::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    Builder::new().spawn_async(f)
 }
 
 /// Spawns a new thread, returning a JoinHandle for it.

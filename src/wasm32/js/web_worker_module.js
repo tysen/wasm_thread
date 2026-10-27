@@ -19,8 +19,9 @@ self.onmessage = event => {
     }).then(() => {
         // Enter rust code by calling entry point defined in `lib.rs`.
         // This executes closure defined by work context.
-        wasm_thread_entry_point(work);
-
+        // Enter rust code; a future's thread hands back a promise the worker lives until.
+        return Promise.resolve(wasm_thread_entry_point(work));
+    }).then(() => {
         // Once done, terminate web worker
         close();
     });
